@@ -1,0 +1,426 @@
+import os
+import json
+import sqlite3
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import httpx
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.enums import ChatType
+from aiogram.filters import Command, CommandStart
+from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = Path(os.getenv('DATA_DIR', '/app/data'))
+if not DATA_DIR.exists():
+    DATA_DIR = BASE_DIR / 'data'
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = Path(os.getenv('DB_PATH', str(DATA_DIR / 'bot.db')))
+KB_PATH = Path(os.getenv('KB_PATH', str(BASE_DIR / 'knowledge_base.json')))
+BOT_TOKEN = os.getenv('BOT_TOKEN', '').strip()
+KIE_API_KEY = os.getenv('KIE_API_KEY', '').strip()
+KIE_API_URL = os.getenv('KIE_API_URL', 'https://api.kie.ai/gpt-5-2/v1/chat/completions').strip()
+ADMIN_ID = int(os.getenv('ADMIN_ID', '0') or '0')
+TEACHER_USERNAME = os.getenv('TEACHER_USERNAME', '').strip().lstrip('@')
+MEMORY_LIMIT = int(os.getenv('MEMORY_LIMIT', '15'))
+if not BOT_TOKEN:
+    raise RuntimeError('BOT_TOKEN is not set')
+with open(KB_PATH, 'r', encoding='utf-8') as f:
+    KB = json.load(f)
+router = Router()
+bot = Bot(BOT_TOKEN)
+MAIN_KB = ReplyKeyboardMarkup(keyboard=[
+    [KeyboardButton(text='📅 Записаться на урок'), KeyboardButton(text='🕒 Свободные окна')],
+    [KeyboardButton(text='📚 Услуги и стоимость'), KeyboardButton(text='⭐ Отзывы')],
+    [KeyboardButton(text='💬 Задать вопрос'), KeyboardButton(text='👤 Связаться с преподавателем')],
+], resize_keyboard=True, input_field_placeholder='Выберите действие или напишите вопрос')
+
+def db():
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    return con
+
+def init_db():
+    with db() as con:
+        con.executescript('''
+        CREATE TABLE IF NOT EXISTS slots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            starts_at TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL DEFAULT 'free',
+            booked_by INTEGER,
+            booked_name TEXT,
+            service_code TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS takeover (
+            user_id INTEGER PRIMARY KEY,
+            until_ts TEXT NOT NULL
+        );
+        ''')
+
+def is_admin(uid):
+    return ADMIN_ID != 0 and uid == ADMIN_ID
+
+def services():
+    return KB['services']
+
+def service_by_code(code):
+    return next((s for s in services() if s['code'] == code), None)
+
+def service_keyboard(prefix='bookservice'):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=s['title'], callback_data=f"{prefix}:{s['code']}")]
+        for s in services()
+    ])
+
+def format_slot(text):
+    dt = datetime.fromisoformat(text)
+    wd = ['Пн','Вт','Ср','Чт','Пт','Сб','Вс']
+    return f"{wd[dt.weekday()]}, {dt:%d.%m.%Y} · {dt:%H:%M}"
+
+def get_free_slots(limit=12):
+    with db() as con:
+        return con.execute(
+            "SELECT * FROM slots WHERE status='free' AND starts_at >= ? ORDER BY starts_at LIMIT ?",
+            (datetime.now().strftime('%Y-%m-%dT%H:%M'), limit)
+        ).fetchall()
+
+def save_message(uid, role, content):
+    with db() as con:
+        con.execute(
+            'INSERT INTO messages(user_id,role,content,created_at) VALUES(?,?,?,?)',
+            (uid, role, content, datetime.now().isoformat(timespec='seconds'))
+        )
+        rows = con.execute(
+            'SELECT id FROM messages WHERE user_id=? ORDER BY id DESC LIMIT ?',
+            (uid, MEMORY_LIMIT)
+        ).fetchall()
+        keep = [r['id'] for r in rows]
+        if keep:
+            ph = ','.join('?' for _ in keep)
+            con.execute(f'DELETE FROM messages WHERE user_id=? AND id NOT IN ({ph})', (uid, *keep))
+
+def get_history(uid):
+    with db() as con:
+        rows = con.execute('SELECT role,content FROM messages WHERE user_id=? ORDER BY id', (uid,)).fetchall()
+    return [{'role': r['role'], 'content': r['content']} for r in rows]
+
+def takeover_active(uid):
+    with db() as con:
+        row = con.execute('SELECT until_ts FROM takeover WHERE user_id=?', (uid,)).fetchone()
+        if not row:
+            return False
+        until = datetime.fromisoformat(row['until_ts'])
+        if until <= datetime.now():
+            con.execute('DELETE FROM takeover WHERE user_id=?', (uid,))
+            return False
+        return True
+
+def set_takeover(uid, hours=24):
+    until = (datetime.now() + timedelta(hours=hours)).isoformat(timespec='seconds')
+    with db() as con:
+        con.execute(
+            'INSERT INTO takeover(user_id,until_ts) VALUES(?,?) '
+            'ON CONFLICT(user_id) DO UPDATE SET until_ts=excluded.until_ts',
+            (uid, until)
+        )
+
+def clear_takeover(uid):
+    with db() as con:
+        con.execute('DELETE FROM takeover WHERE user_id=?', (uid,))
+
+def system_prompt():
+    service_text = '\n'.join(
+        f"- {s['title']}: {s['description']} Длительность: {s['duration']}. Стоимость: {s['price']}."
+        for s in services()
+    )
+    return f'''Ты — вежливый Telegram-администратор преподавателя английского языка проекта Great Opportunities.
+Отвечай только на основе базы знаний. Не придумывай цены, скидки, гарантии, расписание и правила.
+Если данных нет — предложи уточнить у преподавателя. Отвечай кратко и естественно, без навязчивых продаж.
+
+ФАКТЫ:
+{json.dumps(KB['facts'], ensure_ascii=False, indent=2)}
+
+УСЛУГИ:
+{service_text}
+
+Если человек хочет записаться — предложи кнопку «📅 Записаться на урок».
+Если спрашивает о времени — «🕒 Свободные окна».
+Если нужно решение преподавателя — «👤 Связаться с преподавателем».'''
+
+async def ai_answer(uid, text):
+    if not KIE_API_KEY:
+        return 'Сейчас ИИ-консультант ещё не подключён. Можно выбрать услугу, посмотреть свободные окна или связаться с преподавателем.'
+    save_message(uid, 'user', text)
+    payload = {
+        'messages': [{'role': 'system', 'content': system_prompt()}] + get_history(uid),
+        'reasoning_effort': 'low'
+    }
+    headers = {'Authorization': f'Bearer {KIE_API_KEY}', 'Content-Type': 'application/json'}
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(KIE_API_URL, headers=headers, json=payload)
+            r.raise_for_status()
+            data = r.json()
+        answer = data['choices'][0]['message']['content'].strip()
+        save_message(uid, 'assistant', answer)
+        return answer
+    except Exception:
+        return 'Не удалось получить ответ ИИ прямо сейчас. Попробуйте позже или нажмите «👤 Связаться с преподавателем».'
+
+async def notify_admin(text):
+    if ADMIN_ID:
+        try:
+            await bot.send_message(ADMIN_ID, text)
+        except Exception:
+            pass
+
+@router.message(CommandStart())
+async def start(message: Message):
+    if message.chat.type != ChatType.PRIVATE:
+        return
+    text = ('Здравствуйте! 👋\n\nЯ персональный ассистент преподавателя английского языка Great Opportunities. '
+            'Помогу узнать об уроках, посмотреть свободное время, записаться на занятие или задать вопрос.')
+    img = BASE_DIR / 'assets' / 'welcome.jpg'
+    if img.exists():
+        await message.answer_photo(FSInputFile(img), caption=text, reply_markup=MAIN_KB)
+    else:
+        await message.answer(text, reply_markup=MAIN_KB)
+
+@router.message(Command('myid'))
+async def myid(message: Message):
+    if message.chat.type == ChatType.PRIVATE:
+        await message.answer(f'Ваш Telegram ID: {message.from_user.id}')
+
+@router.message(Command('clearhistory'))
+async def clearhistory(message: Message):
+    with db() as con:
+        con.execute('DELETE FROM messages WHERE user_id=?', (message.from_user.id,))
+    await message.answer('История диалога с ИИ очищена.')
+
+@router.message(Command('addslot'))
+async def addslot(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    raw = message.text.replace('/addslot', '', 1).strip()
+    try:
+        dt = datetime.strptime(raw, '%d.%m.%Y %H:%M')
+    except ValueError:
+        await message.answer('Формат: /addslot 25.08.2026 17:00')
+        return
+    try:
+        with db() as con:
+            con.execute('INSERT INTO slots(starts_at,status,created_at) VALUES(?,?,?)',
+                        (dt.strftime('%Y-%m-%dT%H:%M'), 'free', datetime.now().isoformat(timespec='seconds')))
+        await message.answer(f"✅ Добавлено: {format_slot(dt.strftime('%Y-%m-%dT%H:%M'))}")
+    except sqlite3.IntegrityError:
+        await message.answer('Такой слот уже есть.')
+
+@router.message(Command('delslot'))
+async def delslot(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    raw = message.text.replace('/delslot', '', 1).strip()
+    if not raw.isdigit():
+        await message.answer('Формат: /delslot 12')
+        return
+    with db() as con:
+        row = con.execute('SELECT * FROM slots WHERE id=?', (int(raw),)).fetchone()
+        if not row:
+            await message.answer('Слот не найден.')
+            return
+        con.execute('DELETE FROM slots WHERE id=?', (int(raw),))
+    await message.answer(f"🗑 Удалено: {format_slot(row['starts_at'])}")
+
+@router.message(Command('slots'))
+async def slots_admin(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    with db() as con:
+        rows = con.execute('SELECT * FROM slots ORDER BY starts_at LIMIT 50').fetchall()
+    if not rows:
+        await message.answer('Слотов пока нет.')
+        return
+    await message.answer('\n'.join(['Слоты:'] + [f"#{r['id']} · {format_slot(r['starts_at'])} · {r['status']}" for r in rows]))
+
+@router.message(Command('bookings'))
+async def bookings(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    with db() as con:
+        rows = con.execute("SELECT * FROM slots WHERE status='booked' ORDER BY starts_at").fetchall()
+    if not rows:
+        await message.answer('Записей пока нет.')
+        return
+    out = ['Текущие записи:']
+    for r in rows:
+        s = service_by_code(r['service_code']) or {'title': r['service_code']}
+        out.append(f"#{r['id']} · {format_slot(r['starts_at'])}\n{s['title']} · {r['booked_name']} · TG ID {r['booked_by']}")
+    await message.answer('\n\n'.join(out))
+
+@router.message(Command('pause'))
+async def pause_user(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    p = message.text.split()
+    if len(p) < 2 or not p[1].isdigit():
+        await message.answer('Формат: /pause USER_ID [часы]')
+        return
+    uid = int(p[1])
+    hours = int(p[2]) if len(p) > 2 and p[2].isdigit() else 24
+    set_takeover(uid, hours)
+    await message.answer(f'ИИ выключен для {uid} на {hours} ч.')
+
+@router.message(Command('resume'))
+async def resume_user(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    p = message.text.split()
+    if len(p) < 2 or not p[1].isdigit():
+        await message.answer('Формат: /resume USER_ID')
+        return
+    clear_takeover(int(p[1]))
+    await message.answer('ИИ снова активен для клиента.')
+
+@router.message(Command('reply'))
+async def reply_user(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    p = message.text.split(maxsplit=2)
+    if len(p) < 3 or not p[1].isdigit():
+        await message.answer('Формат: /reply USER_ID текст')
+        return
+    uid = int(p[1])
+    try:
+        await bot.send_message(uid, f'Сообщение от преподавателя:\n\n{p[2]}')
+        set_takeover(uid, 24)
+        await message.answer('✅ Отправлено. ИИ для клиента на паузе 24 часа.')
+    except Exception as e:
+        await message.answer(f'Не удалось отправить: {e}')
+
+@router.message(F.text == '📚 Услуги и стоимость')
+async def show_services(message: Message):
+    lines = ['📚 Услуги:']
+    for s in services():
+        lines.append(f"\n<b>{s['title']}</b>\n{s['description']}\n⏱ {s['duration']}\n💳 {s['price']}")
+    await message.answer('\n'.join(lines), parse_mode='HTML', reply_markup=service_keyboard())
+
+@router.message(F.text == '📅 Записаться на урок')
+async def book_start(message: Message):
+    await message.answer('Выберите занятие:', reply_markup=service_keyboard())
+
+@router.callback_query(F.data.startswith('bookservice:'))
+async def choose_service(callback: CallbackQuery):
+    code = callback.data.split(':', 1)[1]
+    s = service_by_code(code)
+    if not s:
+        await callback.answer('Услуга не найдена', show_alert=True)
+        return
+    rows = get_free_slots()
+    if not rows:
+        await callback.message.answer('Сейчас свободных окон нет. Нажмите «👤 Связаться с преподавателем», и мы уточним возможность записи.')
+        await callback.answer()
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=format_slot(r['starts_at']), callback_data=f"pickslot:{r['id']}:{code}")]
+        for r in rows
+    ])
+    await callback.message.answer(f"Вы выбрали: <b>{s['title']}</b>\n\nВыберите свободное время:", parse_mode='HTML', reply_markup=kb)
+    await callback.answer()
+
+@router.callback_query(F.data.startswith('pickslot:'))
+async def pick_slot(callback: CallbackQuery):
+    _, sid, code = callback.data.split(':', 2)
+    with db() as con:
+        row = con.execute("SELECT * FROM slots WHERE id=? AND status='free'", (int(sid),)).fetchone()
+    if not row:
+        await callback.answer('Этот слот уже недоступен.', show_alert=True)
+        return
+    s = service_by_code(code)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✅ Подтвердить', callback_data=f'confirm:{sid}:{code}'), InlineKeyboardButton(text='↩️ Отмена', callback_data='cancel')]])
+    await callback.message.answer(f"Подтвердить запись?\n\n📘 {s['title']}\n🕒 {format_slot(row['starts_at'])}", reply_markup=kb)
+    await callback.answer()
+
+@router.callback_query(F.data.startswith('confirm:'))
+async def confirm_booking(callback: CallbackQuery):
+    _, sid, code = callback.data.split(':', 2)
+    user = callback.from_user
+    name = (user.full_name or user.username or str(user.id)).strip()
+    with db() as con:
+        row = con.execute("SELECT * FROM slots WHERE id=? AND status='free'", (int(sid),)).fetchone()
+        if not row:
+            await callback.answer('Этот слот уже занят.', show_alert=True)
+            return
+        con.execute("UPDATE slots SET status='booked',booked_by=?,booked_name=?,service_code=? WHERE id=? AND status='free'",
+                    (user.id, name, code, int(sid)))
+    s = service_by_code(code)
+    uname = f'@{user.username}' if user.username else 'username не указан'
+    await callback.message.answer(f"✅ Заявка принята.\n\n📘 {s['title']}\n🕒 {format_slot(row['starts_at'])}\n\nПреподаватель получил уведомление.")
+    await notify_admin(f"🔔 Новая запись\n\nИмя: {name}\nTelegram: {uname}\nTG ID: {user.id}\nУслуга: {s['title']}\nВремя: {format_slot(row['starts_at'])}\n\nОтветить: /reply {user.id} Ваш текст")
+    await callback.answer('Запись принята')
+
+@router.callback_query(F.data == 'cancel')
+async def cancel(callback: CallbackQuery):
+    await callback.message.answer('Запись отменена.')
+    await callback.answer()
+
+@router.message(F.text == '🕒 Свободные окна')
+async def show_slots(message: Message):
+    rows = get_free_slots()
+    if not rows:
+        await message.answer('Сейчас свободных окон не опубликовано.')
+        return
+    await message.answer('\n'.join(['🕒 Ближайшие свободные окна:'] + [f"• {format_slot(r['starts_at'])}" for r in rows] + ['\nЧтобы выбрать время, нажмите «📅 Записаться на урок».']))
+
+@router.message(F.text == '⭐ Отзывы')
+async def reviews(message: Message):
+    folder = BASE_DIR / 'assets' / 'reviews'
+    imgs = sorted([p for p in folder.glob('*') if p.suffix.lower() in {'.jpg','.jpeg','.png','.webp'}])[:5]
+    if not imgs:
+        await message.answer('Отзывы скоро появятся здесь.')
+        return
+    await message.answer('⭐ Несколько отзывов учеников и родителей:')
+    for p in imgs:
+        await message.answer_photo(FSInputFile(p))
+
+@router.message(F.text == '👤 Связаться с преподавателем')
+async def contact(message: Message):
+    u = message.from_user
+    uname = f'@{u.username}' if u.username else 'username не указан'
+    await notify_admin(f"👤 Клиент просит связаться\n\nИмя: {u.full_name}\nTelegram: {uname}\nTG ID: {u.id}\n\nОтветить: /reply {u.id} Ваш текст")
+    if TEACHER_USERNAME:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='Открыть профиль преподавателя', url=f'https://t.me/{TEACHER_USERNAME}')]])
+        await message.answer('Я уведомил преподавателя. Также можно написать напрямую:', reply_markup=kb)
+    else:
+        await message.answer('Я передал преподавателю, что вы хотите связаться.')
+
+@router.message(F.text == '💬 Задать вопрос')
+async def ask_prompt(message: Message):
+    await message.answer('Напишите вопрос обычным сообщением. Я отвечу на основе информации о занятиях и услугах.')
+
+@router.message(F.text)
+async def free_text(message: Message):
+    if message.chat.type != ChatType.PRIVATE or message.text.startswith('/'):
+        return
+    uid = message.from_user.id
+    if takeover_active(uid):
+        await notify_admin(f"💬 Сообщение клиента (ИИ на паузе)\n\n{message.from_user.full_name} · TG ID {uid}\n{message.text}\n\nОтветить: /reply {uid} Ваш текст")
+        return
+    await message.answer(await ai_answer(uid, message.text))
+
+async def main():
+    init_db()
+    dp = Dispatcher()
+    dp.include_router(router)
+    await dp.start_polling(bot)
+
+if __name__ == '__main__':
+    import asyncio
+    asyncio.run(main())
