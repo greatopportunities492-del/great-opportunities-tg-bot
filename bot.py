@@ -17,7 +17,7 @@ if not DATA_DIR.exists():
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = Path(os.getenv('DB_PATH', str(DATA_DIR / 'bot.db')))
 KB_PATH = Path(os.getenv('KB_PATH', str(BASE_DIR / 'knowledge_base.json')))
-BOT_TOKEN = (os.getenv("TG_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
+BOT_TOKEN = os.getenv('BOT_TOKEN', '').strip()
 KIE_API_KEY = os.getenv('KIE_API_KEY', '').strip()
 KIE_API_URL = os.getenv('KIE_API_URL', 'https://api.kie.ai/gpt-5-2/v1/chat/completions').strip()
 ADMIN_ID = int(os.getenv('ADMIN_ID', '0') or '0')
@@ -388,7 +388,10 @@ async def reviews(message: Message):
         return
     await message.answer('⭐ Несколько отзывов учеников и родителей:')
     for p in imgs:
-        await message.answer_photo(FSInputFile(p))
+        caption = None
+        if p.name == '00 Admission 2026.png':
+            caption = 'Не каждый день три года твоей работы возвращаются к тебе одной фразой: «Я поступила туда, куда мечтала».'
+        await message.answer_photo(FSInputFile(p), caption=caption)
 
 @router.message(F.text == '👤 Связаться с преподавателем')
 async def contact(message: Message):
