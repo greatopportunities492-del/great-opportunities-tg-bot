@@ -382,16 +382,13 @@ async def show_slots(message: Message):
 @router.message(F.text == '⭐ Отзывы')
 async def reviews(message: Message):
     folder = BASE_DIR / 'assets' / 'reviews'
-    imgs = sorted([p for p in folder.glob('*') if p.suffix.lower() in {'.jpg','.jpeg','.png','.webp'}])[:5]
+    imgs = sorted([p for p in folder.glob('*') if p.suffix.lower() in {'.jpg','.jpeg','.png','.webp'}])
     if not imgs:
         await message.answer('Отзывы скоро появятся здесь.')
         return
     await message.answer('⭐ Несколько отзывов учеников и родителей:')
     for p in imgs:
-        caption = None
-        if p.name == '00 Admission 2026.png':
-            caption = 'Не каждый день три года твоей работы возвращаются к тебе одной фразой: «Я поступила туда, куда мечтала».'
-        await message.answer_photo(FSInputFile(p), caption=caption)
+        await message.answer_photo(FSInputFile(p))
 
 @router.message(F.text == '👤 Связаться с преподавателем')
 async def contact(message: Message):
