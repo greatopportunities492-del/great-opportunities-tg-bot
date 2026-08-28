@@ -586,11 +586,12 @@ async def confirm_series(callback: CallbackQuery):
     dates_text = ', '.join(dt.strftime('%d.%m') for dt in dates)
     uname = f'@{user.username}' if user.username else 'username не указан'
     await callback.message.answer(
-        f"✅ Регулярная запись подтверждена.\n\n"
+        f"✅ Запись успешно оформлена!\n\n"
         f"📘 {s['title']}\n"
         f"🗓 {WEEKDAY_NAMES[weekday]} · {hour:02d}:00\n"
         f"📅 {dates_text}\n\n"
-        "Время закреплено на 4 недели. Если нужно второе занятие в неделю, нажмите «📅 Записаться на урок» ещё раз и выберите второе постоянное время."
+        "Время закреплено за учеником на 4 недели. Дополнительного подтверждения от преподавателя не требуется.\n\n"
+        "Если нужно второе занятие в неделю, нажмите «📅 Записаться на урок» ещё раз и выберите второе постоянное время."
     )
     await notify_admin(
         f"🔔 Новая регулярная запись\n\n"
@@ -598,6 +599,7 @@ async def confirm_series(callback: CallbackQuery):
         f"Услуга: {s['title']}\n"
         f"Время: {WEEKDAY_NAMES[weekday]} · {hour:02d}:00\n"
         f"Даты: {dates_text}\n\n"
+        "✅ Клиенту автоматически отправлено подтверждение записи.\n\n"
         f"Ответить: /reply {user.id} Ваш текст"
     )
     await callback.answer('Запись подтверждена')
