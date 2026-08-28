@@ -43,13 +43,27 @@ SCHEDULE_END = SCHEDULE_START + timedelta(days=SCHEDULE_DAYS)
 WEEKDAY_NAMES = {0: 'Понедельник', 1: 'Вторник', 2: 'Среда', 3: 'Четверг', 4: 'Пятница', 5: 'Суббота'}
 WEEKDAY_SHORT = {0: 'Пн', 1: 'Вт', 2: 'Ср', 3: 'Чт', 4: 'Пт', 5: 'Сб'}
 RECURRING_HOURS = {
-    0: list(range(16, 22)),
-    1: list(range(16, 22)),
-    2: list(range(16, 22)),
-    3: list(range(16, 22)),
-    4: list(range(16, 22)),
-    5: list(range(9, 21)),
+    0: ['16:00', '17:00', '18:00', '19:00', '20:00', '21:00'],
+    1: ['16:00', '17:00', '18:00', '19:00', '20:30', '21:00'],
+    2: ['16:00', '17:00', '18:00', '19:00', '20:00', '21:00'],
+    3: ['16:00', '17:00', '18:00', '19:00', '20:00', '21:00'],
+    4: ['16:00', '17:00', '18:00', '19:00', '20:30', '21:00'],
+    5: ['09:00', '10:30', '11:30', '12:30', '13:30', '14:30', '15:30', '16:30', '17:30', '18:30', '19:30', '20:30'],
 }
+
+def parse_recurring_time(value):
+    raw = str(value).strip()
+    if ':' in raw:
+        hour_raw, minute_raw = raw.split(':', 1)
+    elif '-' in raw:
+        hour_raw, minute_raw = raw.split('-', 1)
+    else:
+        hour_raw, minute_raw = raw, '0'
+    return int(hour_raw), int(minute_raw)
+
+def recurring_time_label(value):
+    hour, minute = parse_recurring_time(value)
+    return f'{hour:02d}:{minute:02d}'
 
 def db():
     con = sqlite3.connect(DB_PATH)
@@ -162,8 +176,9 @@ def schedule_datetimes():
     result = []
     for offset in range(SCHEDULE_DAYS):
         day = SCHEDULE_START + timedelta(days=offset)
-        for hour in RECURRING_HOURS.get(day.weekday(), []):
-            result.append(day.replace(hour=hour, minute=0, second=0, microsecond=0))
+        for time_value in RECURRING_HOURS.get(day.weekday(), []):
+            hour, minute = parse_recurring_time(time_value)
+            result.append(day.replace(hour=hour, minute=minute, second=0, microsecond=0))
     return result
 
 def sync_recurring_schedule():
@@ -181,18 +196,19 @@ def sync_recurring_schedule():
             [(starts_at, 'free', now) for starts_at in expected]
         )
 
-def series_datetimes(weekday, hour, future_only=True):
+def series_datetimes(weekday, time_value, future_only=True):
+    hour, minute = parse_recurring_time(time_value)
     items = [
         dt for dt in schedule_datetimes()
-        if dt.weekday() == weekday and dt.hour == hour
+        if dt.weekday() == weekday and dt.hour == hour and dt.minute == minute
     ]
     if future_only:
         now = datetime.now()
         items = [dt for dt in items if dt >= now]
     return items
 
-def series_rows(weekday, hour):
-    dates = series_datetimes(weekday, hour, future_only=True)
+def series_rows(weekday, time_value):
+    dates = series_datetimes(weekday, time_value, future_only=True)
     if not dates:
         return []
     keys = [dt.strftime('%Y-%m-%dT%H:%M') for dt in dates]
@@ -204,16 +220,16 @@ def series_rows(weekday, hour):
         ).fetchall()
     return rows
 
-def series_available(weekday, hour):
-    dates = series_datetimes(weekday, hour, future_only=True)
-    rows = series_rows(weekday, hour)
+def series_available(weekday, time_value):
+    dates = series_datetimes(weekday, time_value, future_only=True)
+    rows = series_rows(weekday, time_value)
     return bool(dates) and len(rows) == len(dates) and all(r['status'] == 'free' for r in rows)
 
 def available_times_for_day(weekday):
-    return [hour for hour in RECURRING_HOURS.get(weekday, []) if series_available(weekday, hour)]
+    return [time_value for time_value in RECURRING_HOURS.get(weekday, []) if series_available(weekday, time_value)]
 
-def series_dates_text(weekday, hour):
-    return ', '.join(dt.strftime('%d.%m') for dt in series_datetimes(weekday, hour, future_only=True))
+def series_dates_text(weekday, time_value):
+    return ', '.join(dt.strftime('%d.%m') for dt in series_datetimes(weekday, time_value, future_only=True))
 
 def get_free_slots(limit=12):
     with db() as con:
@@ -510,8 +526,9 @@ async def pick_day(callback: CallbackQuery):
 
     buttons = []
     row = []
-    for hour in hours:
-        row.append(InlineKeyboardButton(text=f'{hour:02d}:00', callback_data=f'pickseries:{code}:{weekday}:{hour}'))
+    for time_value in hours:
+        label = recurring_time_label(time_value)
+        row.append(InlineKeyboardButton(text=label, callback_data=f'pickseries:{code}:{weekday}:{time_value}'))
         if len(row) == 2:
             buttons.append(row)
             row = []
@@ -527,23 +544,24 @@ async def pick_day(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith('pickseries:'))
 async def pick_series(callback: CallbackQuery):
-    _, code, weekday_raw, hour_raw = callback.data.split(':', 3)
+    _, code, weekday_raw, time_raw = callback.data.split(':', 3)
     weekday = int(weekday_raw)
-    hour = int(hour_raw)
+    time_value = time_raw
+    label = recurring_time_label(time_value)
     s = service_by_code(code)
-    if not s or not series_available(weekday, hour):
+    if not s or not series_available(weekday, time_value):
         await callback.answer('Это регулярное время уже недоступно.', show_alert=True)
         return
 
-    dates = series_dates_text(weekday, hour)
+    dates = series_dates_text(weekday, time_value)
     kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text='✅ Подтвердить', callback_data=f'confirmseries:{code}:{weekday}:{hour}'),
+        InlineKeyboardButton(text='✅ Подтвердить', callback_data=f'confirmseries:{code}:{weekday}:{time_value}'),
         InlineKeyboardButton(text='↩️ Отмена', callback_data='cancel')
     ]])
     await callback.message.answer(
         f"Подтвердить регулярную запись?\n\n"
         f"📘 {s['title']}\n"
-        f"🗓 {WEEKDAY_NAMES[weekday]} · {hour:02d}:00\n"
+        f"🗓 {WEEKDAY_NAMES[weekday]} · {label}\n"
         f"📅 Даты: {dates}\n\n"
         "Это время будет закреплено за учеником на 4 недели.",
         reply_markup=kb
@@ -552,15 +570,16 @@ async def pick_series(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith('confirmseries:'))
 async def confirm_series(callback: CallbackQuery):
-    _, code, weekday_raw, hour_raw = callback.data.split(':', 3)
+    _, code, weekday_raw, time_raw = callback.data.split(':', 3)
     weekday = int(weekday_raw)
-    hour = int(hour_raw)
+    time_value = time_raw
+    label = recurring_time_label(time_value)
     s = service_by_code(code)
     if not s:
         await callback.answer('Услуга не найдена', show_alert=True)
         return
 
-    dates = series_datetimes(weekday, hour, future_only=True)
+    dates = series_datetimes(weekday, time_value, future_only=True)
     if not dates:
         await callback.answer('Это время уже недоступно.', show_alert=True)
         return
@@ -588,7 +607,7 @@ async def confirm_series(callback: CallbackQuery):
     await callback.message.answer(
         f"✅ Запись успешно оформлена!\n\n"
         f"📘 {s['title']}\n"
-        f"🗓 {WEEKDAY_NAMES[weekday]} · {hour:02d}:00\n"
+        f"🗓 {WEEKDAY_NAMES[weekday]} · {label}\n"
         f"📅 {dates_text}\n\n"
         "Время закреплено за учеником на 4 недели. Дополнительного подтверждения от преподавателя не требуется.\n\n"
         "Если нужно второе занятие в неделю, нажмите «📅 Записаться на урок» ещё раз и выберите второе постоянное время."
@@ -597,7 +616,7 @@ async def confirm_series(callback: CallbackQuery):
         f"🔔 Новая регулярная запись\n\n"
         f"Имя: {name}\nTelegram: {uname}\nTG ID: {user.id}\n"
         f"Услуга: {s['title']}\n"
-        f"Время: {WEEKDAY_NAMES[weekday]} · {hour:02d}:00\n"
+        f"Время: {WEEKDAY_NAMES[weekday]} · {label}\n"
         f"Даты: {dates_text}\n\n"
         "✅ Клиенту автоматически отправлено подтверждение записи.\n\n"
         f"Ответить: /reply {user.id} Ваш текст"
@@ -656,7 +675,7 @@ async def show_slots(message: Message):
         hours = available_times_for_day(weekday)
         if hours:
             found = True
-            lines.append(f"\n<b>{WEEKDAY_NAMES[weekday]}</b>: " + ', '.join(f'{h:02d}:00' for h in hours))
+            lines.append(f"\n<b>{WEEKDAY_NAMES[weekday]}</b>: " + ', '.join(recurring_time_label(t) for t in hours))
     if not found:
         await message.answer('Сейчас свободных регулярных окон не опубликовано.')
         return
