@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -78,6 +79,16 @@ def init_db():
             user_id INTEGER PRIMARY KEY,
             until_ts TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS student_profiles (
+            user_id INTEGER PRIMARY KEY,
+            student_name TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS booking_drafts (
+            user_id INTEGER PRIMARY KEY,
+            service_code TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
         ''')
     sync_recurring_schedule()
 
@@ -89,6 +100,52 @@ def services():
 
 def service_by_code(code):
     return next((s for s in services() if s['code'] == code), None)
+
+def get_student_name(user_id):
+    with db() as con:
+        row = con.execute(
+            'SELECT student_name FROM student_profiles WHERE user_id=?',
+            (user_id,)
+        ).fetchone()
+    return row['student_name'] if row else None
+
+def save_student_name(user_id, student_name):
+    with db() as con:
+        con.execute(
+            'INSERT INTO student_profiles(user_id,student_name,updated_at) VALUES(?,?,?) '
+            'ON CONFLICT(user_id) DO UPDATE SET student_name=excluded.student_name, updated_at=excluded.updated_at',
+            (user_id, student_name, datetime.now().isoformat(timespec='seconds'))
+        )
+
+def set_booking_draft(user_id, service_code):
+    with db() as con:
+        con.execute(
+            'INSERT INTO booking_drafts(user_id,service_code,created_at) VALUES(?,?,?) '
+            'ON CONFLICT(user_id) DO UPDATE SET service_code=excluded.service_code, created_at=excluded.created_at',
+            (user_id, service_code, datetime.now().isoformat(timespec='seconds'))
+        )
+
+def get_booking_draft(user_id):
+    with db() as con:
+        return con.execute(
+            'SELECT service_code FROM booking_drafts WHERE user_id=?',
+            (user_id,)
+        ).fetchone()
+
+def clear_booking_draft(user_id):
+    with db() as con:
+        con.execute('DELETE FROM booking_drafts WHERE user_id=?', (user_id,))
+
+def normalize_student_name(text):
+    value = ' '.join((text or '').strip().split())
+    if not 3 <= len(value) <= 80:
+        return None
+    words = value.split()
+    if not 2 <= len(words) <= 4:
+        return None
+    if not all(re.fullmatch(r"[A-Za-zА-Яа-яЁё'-]+", word) for word in words):
+        return None
+    return value
 
 def service_keyboard(prefix='bookservice'):
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -259,6 +316,7 @@ async def notify_admin(text):
 async def start(message: Message):
     if message.chat.type != ChatType.PRIVATE:
         return
+    clear_booking_draft(message.from_user.id)
     text = ('Здравствуйте! 👋\n\nЯ персональный ассистент преподавателя английского языка Great Opportunities. '
             'Помогу узнать об уроках, посмотреть свободное время, записаться на занятие или задать вопрос.')
     img = BASE_DIR / 'assets' / 'welcome.jpg'
@@ -385,8 +443,29 @@ async def show_services(message: Message):
         lines.append(f"\n<b>{s['title']}</b>\n{s['description']}\n⏱ {s['duration']}\n💳 {s['price']}")
     await message.answer('\n'.join(lines), parse_mode='HTML', reply_markup=service_keyboard())
 
+async def send_day_picker(message: Message, code):
+    s = service_by_code(code)
+    if not s:
+        await message.answer('Услуга не найдена.')
+        return
+    days = [wd for wd in RECURRING_HOURS if available_times_for_day(wd)]
+    if not days:
+        await message.answer('Сейчас свободных регулярных окон нет. Нажмите «👤 Связаться с преподавателем», и мы уточним возможность записи.')
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=WEEKDAY_NAMES[wd], callback_data=f"pickday:{code}:{wd}")]
+        for wd in days
+    ])
+    await message.answer(
+        f"Вы выбрали: <b>{s['title']}</b>\n\n"
+        "Выберите постоянный день недели. Выбранное время закрепится на 4 недели:",
+        parse_mode='HTML',
+        reply_markup=kb
+    )
+
 @router.message(F.text == '📅 Записаться на урок')
 async def book_start(message: Message):
+    clear_booking_draft(message.from_user.id)
     await message.answer('Выберите занятие:', reply_markup=service_keyboard())
 
 @router.callback_query(F.data.startswith('bookservice:'))
@@ -397,22 +476,23 @@ async def choose_service(callback: CallbackQuery):
         await callback.answer('Услуга не найдена', show_alert=True)
         return
 
-    days = [wd for wd in RECURRING_HOURS if available_times_for_day(wd)]
-    if not days:
-        await callback.message.answer('Сейчас свободных регулярных окон нет. Нажмите «👤 Связаться с преподавателем», и мы уточним возможность записи.')
+    student_name = get_student_name(callback.from_user.id)
+    if not student_name:
+        set_booking_draft(callback.from_user.id, code)
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text='↩️ Отмена', callback_data='cancelname')
+        ]])
+        await callback.message.answer(
+            "Перед первой записью напиши <b>имя и фамилию ученика</b> одним сообщением.\n\n"
+            "Например: <b>Анна Иванова</b>.\n"
+            "Ник, эмодзи или только одно имя не подойдут.",
+            parse_mode='HTML',
+            reply_markup=kb
+        )
         await callback.answer()
         return
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=WEEKDAY_NAMES[wd], callback_data=f"pickday:{code}:{wd}")]
-        for wd in days
-    ])
-    await callback.message.answer(
-        f"Вы выбрали: <b>{s['title']}</b>\n\n"
-        "Выберите постоянный день недели. Выбранное время закрепится на 4 недели:",
-        parse_mode='HTML',
-        reply_markup=kb
-    )
+    await send_day_picker(callback.message, code)
     await callback.answer()
 
 @router.callback_query(F.data.startswith('pickday:'))
@@ -487,7 +567,7 @@ async def confirm_series(callback: CallbackQuery):
     keys = [dt.strftime('%Y-%m-%dT%H:%M') for dt in dates]
     ph = ','.join('?' for _ in keys)
     user = callback.from_user
-    name = (user.full_name or user.username or str(user.id)).strip()
+    name = get_student_name(user.id) or (user.full_name or user.username or str(user.id)).strip()
 
     with db() as con:
         rows = con.execute(
@@ -540,7 +620,7 @@ async def pick_slot(callback: CallbackQuery):
 async def confirm_booking(callback: CallbackQuery):
     _, sid, code = callback.data.split(':', 2)
     user = callback.from_user
-    name = (user.full_name or user.username or str(user.id)).strip()
+    name = get_student_name(user.id) or (user.full_name or user.username or str(user.id)).strip()
     with db() as con:
         row = con.execute("SELECT * FROM slots WHERE id=? AND status='free'", (int(sid),)).fetchone()
         if not row:
@@ -554,8 +634,15 @@ async def confirm_booking(callback: CallbackQuery):
     await notify_admin(f"🔔 Новая запись\n\nИмя: {name}\nTelegram: {uname}\nTG ID: {user.id}\nУслуга: {s['title']}\nВремя: {format_slot(row['starts_at'])}\n\nОтветить: /reply {user.id} Ваш текст")
     await callback.answer('Запись принята')
 
+@router.callback_query(F.data == 'cancelname')
+async def cancel_name(callback: CallbackQuery):
+    clear_booking_draft(callback.from_user.id)
+    await callback.message.answer('Запись отменена.')
+    await callback.answer()
+
 @router.callback_query(F.data == 'cancel')
 async def cancel(callback: CallbackQuery):
+    clear_booking_draft(callback.from_user.id)
     await callback.message.answer('Запись отменена.')
     await callback.answer()
 
@@ -609,6 +696,23 @@ async def free_text(message: Message):
     if message.chat.type != ChatType.PRIVATE or message.text.startswith('/'):
         return
     uid = message.from_user.id
+
+    draft = get_booking_draft(uid)
+    if draft:
+        student_name = normalize_student_name(message.text)
+        if not student_name:
+            await message.answer(
+                'Пожалуйста, напиши имя и фамилию ученика словами, например: Анна Иванова.\n'
+                'Нужно минимум два слова, без ников, цифр и эмодзи.'
+            )
+            return
+        code = draft['service_code']
+        save_student_name(uid, student_name)
+        clear_booking_draft(uid)
+        await message.answer(f'✅ Спасибо! Запись оформляем на: <b>{student_name}</b>.', parse_mode='HTML')
+        await send_day_picker(message, code)
+        return
+
     if takeover_active(uid):
         await notify_admin(f"💬 Сообщение клиента (ИИ на паузе)\n\n{message.from_user.full_name} · TG ID {uid}\n{message.text}\n\nОтветить: /reply {uid} Ваш текст")
         return
