@@ -35,6 +35,21 @@ MAIN_KB = ReplyKeyboardMarkup(keyboard=[
     [KeyboardButton(text='💬 Задать вопрос'), KeyboardButton(text='👤 Связаться с преподавателем')],
 ], resize_keyboard=True, input_field_placeholder='Выберите действие или напишите вопрос')
 
+# Повторяющееся расписание на 4 недели с 1 сентября 2026 года.
+SCHEDULE_START = datetime(2026, 9, 1, 0, 0)
+SCHEDULE_DAYS = 28
+SCHEDULE_END = SCHEDULE_START + timedelta(days=SCHEDULE_DAYS)
+WEEKDAY_NAMES = {0: 'Понедельник', 1: 'Вторник', 2: 'Среда', 3: 'Четверг', 4: 'Пятница', 5: 'Суббота'}
+WEEKDAY_SHORT = {0: 'Пн', 1: 'Вт', 2: 'Ср', 3: 'Чт', 4: 'Пт', 5: 'Сб'}
+RECURRING_HOURS = {
+    0: list(range(16, 22)),
+    1: list(range(16, 22)),
+    2: list(range(16, 22)),
+    3: list(range(16, 22)),
+    4: list(range(16, 22)),
+    5: list(range(9, 21)),
+}
+
 def db():
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
@@ -64,6 +79,7 @@ def init_db():
             until_ts TEXT NOT NULL
         );
         ''')
+    sync_recurring_schedule()
 
 def is_admin(uid):
     return ADMIN_ID != 0 and uid == ADMIN_ID
@@ -84,6 +100,63 @@ def format_slot(text):
     dt = datetime.fromisoformat(text)
     wd = ['Пн','Вт','Ср','Чт','Пт','Сб','Вс']
     return f"{wd[dt.weekday()]}, {dt:%d.%m.%Y} · {dt:%H:%M}"
+
+def schedule_datetimes():
+    result = []
+    for offset in range(SCHEDULE_DAYS):
+        day = SCHEDULE_START + timedelta(days=offset)
+        for hour in RECURRING_HOURS.get(day.weekday(), []):
+            result.append(day.replace(hour=hour, minute=0, second=0, microsecond=0))
+    return result
+
+def sync_recurring_schedule():
+    # Синхронизируем только свободные окна в заданном 4-недельном периоде.
+    # Уже занятые записи не затрагиваются.
+    expected = [dt.strftime('%Y-%m-%dT%H:%M') for dt in schedule_datetimes()]
+    with db() as con:
+        con.execute(
+            "DELETE FROM slots WHERE status='free' AND starts_at >= ? AND starts_at < ?",
+            (SCHEDULE_START.strftime('%Y-%m-%dT%H:%M'), SCHEDULE_END.strftime('%Y-%m-%dT%H:%M'))
+        )
+        now = datetime.now().isoformat(timespec='seconds')
+        con.executemany(
+            "INSERT OR IGNORE INTO slots(starts_at,status,created_at) VALUES(?,?,?)",
+            [(starts_at, 'free', now) for starts_at in expected]
+        )
+
+def series_datetimes(weekday, hour, future_only=True):
+    items = [
+        dt for dt in schedule_datetimes()
+        if dt.weekday() == weekday and dt.hour == hour
+    ]
+    if future_only:
+        now = datetime.now()
+        items = [dt for dt in items if dt >= now]
+    return items
+
+def series_rows(weekday, hour):
+    dates = series_datetimes(weekday, hour, future_only=True)
+    if not dates:
+        return []
+    keys = [dt.strftime('%Y-%m-%dT%H:%M') for dt in dates]
+    ph = ','.join('?' for _ in keys)
+    with db() as con:
+        rows = con.execute(
+            f"SELECT * FROM slots WHERE starts_at IN ({ph}) ORDER BY starts_at",
+            keys
+        ).fetchall()
+    return rows
+
+def series_available(weekday, hour):
+    dates = series_datetimes(weekday, hour, future_only=True)
+    rows = series_rows(weekday, hour)
+    return bool(dates) and len(rows) == len(dates) and all(r['status'] == 'free' for r in rows)
+
+def available_times_for_day(weekday):
+    return [hour for hour in RECURRING_HOURS.get(weekday, []) if series_available(weekday, hour)]
+
+def series_dates_text(weekday, hour):
+    return ', '.join(dt.strftime('%d.%m') for dt in series_datetimes(weekday, hour, future_only=True))
 
 def get_free_slots(limit=12):
     with db() as con:
@@ -323,18 +396,133 @@ async def choose_service(callback: CallbackQuery):
     if not s:
         await callback.answer('Услуга не найдена', show_alert=True)
         return
-    rows = get_free_slots()
-    if not rows:
-        await callback.message.answer('Сейчас свободных окон нет. Нажмите «👤 Связаться с преподавателем», и мы уточним возможность записи.')
+
+    days = [wd for wd in RECURRING_HOURS if available_times_for_day(wd)]
+    if not days:
+        await callback.message.answer('Сейчас свободных регулярных окон нет. Нажмите «👤 Связаться с преподавателем», и мы уточним возможность записи.')
         await callback.answer()
         return
+
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=format_slot(r['starts_at']), callback_data=f"pickslot:{r['id']}:{code}")]
-        for r in rows
+        [InlineKeyboardButton(text=WEEKDAY_NAMES[wd], callback_data=f"pickday:{code}:{wd}")]
+        for wd in days
     ])
-    await callback.message.answer(f"Вы выбрали: <b>{s['title']}</b>\n\nВыберите свободное время:", parse_mode='HTML', reply_markup=kb)
+    await callback.message.answer(
+        f"Вы выбрали: <b>{s['title']}</b>\n\n"
+        "Выберите постоянный день недели. Выбранное время закрепится на 4 недели:",
+        parse_mode='HTML',
+        reply_markup=kb
+    )
     await callback.answer()
 
+@router.callback_query(F.data.startswith('pickday:'))
+async def pick_day(callback: CallbackQuery):
+    _, code, weekday_raw = callback.data.split(':', 2)
+    weekday = int(weekday_raw)
+    s = service_by_code(code)
+    if not s:
+        await callback.answer('Услуга не найдена', show_alert=True)
+        return
+    hours = available_times_for_day(weekday)
+    if not hours:
+        await callback.answer('На этот день свободных регулярных окон уже нет.', show_alert=True)
+        return
+
+    buttons = []
+    row = []
+    for hour in hours:
+        row.append(InlineKeyboardButton(text=f'{hour:02d}:00', callback_data=f'pickseries:{code}:{weekday}:{hour}'))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton(text='↩️ Назад к дням', callback_data=f'bookservice:{code}')])
+    await callback.message.answer(
+        f"<b>{WEEKDAY_NAMES[weekday]}</b>\nВыберите постоянное время:",
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith('pickseries:'))
+async def pick_series(callback: CallbackQuery):
+    _, code, weekday_raw, hour_raw = callback.data.split(':', 3)
+    weekday = int(weekday_raw)
+    hour = int(hour_raw)
+    s = service_by_code(code)
+    if not s or not series_available(weekday, hour):
+        await callback.answer('Это регулярное время уже недоступно.', show_alert=True)
+        return
+
+    dates = series_dates_text(weekday, hour)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text='✅ Подтвердить', callback_data=f'confirmseries:{code}:{weekday}:{hour}'),
+        InlineKeyboardButton(text='↩️ Отмена', callback_data='cancel')
+    ]])
+    await callback.message.answer(
+        f"Подтвердить регулярную запись?\n\n"
+        f"📘 {s['title']}\n"
+        f"🗓 {WEEKDAY_NAMES[weekday]} · {hour:02d}:00\n"
+        f"📅 Даты: {dates}\n\n"
+        "Это время будет закреплено за учеником на 4 недели.",
+        reply_markup=kb
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith('confirmseries:'))
+async def confirm_series(callback: CallbackQuery):
+    _, code, weekday_raw, hour_raw = callback.data.split(':', 3)
+    weekday = int(weekday_raw)
+    hour = int(hour_raw)
+    s = service_by_code(code)
+    if not s:
+        await callback.answer('Услуга не найдена', show_alert=True)
+        return
+
+    dates = series_datetimes(weekday, hour, future_only=True)
+    if not dates:
+        await callback.answer('Это время уже недоступно.', show_alert=True)
+        return
+    keys = [dt.strftime('%Y-%m-%dT%H:%M') for dt in dates]
+    ph = ','.join('?' for _ in keys)
+    user = callback.from_user
+    name = (user.full_name or user.username or str(user.id)).strip()
+
+    with db() as con:
+        rows = con.execute(
+            f"SELECT * FROM slots WHERE starts_at IN ({ph}) ORDER BY starts_at",
+            keys
+        ).fetchall()
+        if len(rows) != len(keys) or any(r['status'] != 'free' for r in rows):
+            await callback.answer('К сожалению, это регулярное время только что стало недоступно.', show_alert=True)
+            return
+        con.execute(
+            f"UPDATE slots SET status='booked',booked_by=?,booked_name=?,service_code=? "
+            f"WHERE starts_at IN ({ph}) AND status='free'",
+            (user.id, name, code, *keys)
+        )
+
+    dates_text = ', '.join(dt.strftime('%d.%m') for dt in dates)
+    uname = f'@{user.username}' if user.username else 'username не указан'
+    await callback.message.answer(
+        f"✅ Регулярная запись подтверждена.\n\n"
+        f"📘 {s['title']}\n"
+        f"🗓 {WEEKDAY_NAMES[weekday]} · {hour:02d}:00\n"
+        f"📅 {dates_text}\n\n"
+        "Время закреплено на 4 недели. Если нужно второе занятие в неделю, нажмите «📅 Записаться на урок» ещё раз и выберите второе постоянное время."
+    )
+    await notify_admin(
+        f"🔔 Новая регулярная запись\n\n"
+        f"Имя: {name}\nTelegram: {uname}\nTG ID: {user.id}\n"
+        f"Услуга: {s['title']}\n"
+        f"Время: {WEEKDAY_NAMES[weekday]} · {hour:02d}:00\n"
+        f"Даты: {dates_text}\n\n"
+        f"Ответить: /reply {user.id} Ваш текст"
+    )
+    await callback.answer('Запись подтверждена')
+
+# Старые callback-обработчики оставлены для совместимости с ранее отправленными сообщениями.
 @router.callback_query(F.data.startswith('pickslot:'))
 async def pick_slot(callback: CallbackQuery):
     _, sid, code = callback.data.split(':', 2)
@@ -373,11 +561,18 @@ async def cancel(callback: CallbackQuery):
 
 @router.message(F.text == '🕒 Свободные окна')
 async def show_slots(message: Message):
-    rows = get_free_slots()
-    if not rows:
-        await message.answer('Сейчас свободных окон не опубликовано.')
+    lines = ['🕒 Свободные регулярные окна на 4 недели с 1 сентября:']
+    found = False
+    for weekday in RECURRING_HOURS:
+        hours = available_times_for_day(weekday)
+        if hours:
+            found = True
+            lines.append(f"\n<b>{WEEKDAY_NAMES[weekday]}</b>: " + ', '.join(f'{h:02d}:00' for h in hours))
+    if not found:
+        await message.answer('Сейчас свободных регулярных окон не опубликовано.')
         return
-    await message.answer('\n'.join(['🕒 Ближайшие свободные окна:'] + [f"• {format_slot(r['starts_at'])}" for r in rows] + ['\nЧтобы выбрать время, нажмите «📅 Записаться на урок».']))
+    lines.append('\nЧтобы закрепить время на 4 недели, нажмите «📅 Записаться на урок».')
+    await message.answer('\n'.join(lines), parse_mode='HTML')
 
 @router.message(F.text == '⭐ Отзывы')
 async def reviews(message: Message):
@@ -387,8 +582,12 @@ async def reviews(message: Message):
         await message.answer('Отзывы скоро появятся здесь.')
         return
     await message.answer('⭐ Несколько отзывов учеников и родителей:')
+    captions = {
+        '00 Admission 2026.png': 'Не каждый день три года твоей работы возвращаются к тебе одной фразой: «Я поступила туда, куда мечтала».',
+        '00B Admission Plekhanov 2026.png': '«Пришел приказ о зачислении! Спасибо Вам за труд и силы! Это было феерично!»',
+    }
     for p in imgs:
-        await message.answer_photo(FSInputFile(p))
+        await message.answer_photo(FSInputFile(p), caption=captions.get(p.name))
 
 @router.message(F.text == '👤 Связаться с преподавателем')
 async def contact(message: Message):
