@@ -51,6 +51,8 @@ RECURRING_HOURS = {
     5: ['09:00', '13:00', '14:00', '15:00', '16:00', '17:00', '18:00', '19:00', '20:00', '21:00'],
 }
 
+BLOCKED_RECURRING_SLOTS = {(3, '16:00'), (5, '10:30')}
+
 def parse_recurring_time(value):
     raw = str(value).strip()
     if ':' in raw:
@@ -186,6 +188,8 @@ def sync_recurring_schedule():
     # Уже занятые записи не затрагиваются.
     expected = [dt.strftime('%Y-%m-%dT%H:%M') for dt in schedule_datetimes()]
     with db() as con:
+        con.execute("DELETE FROM slots WHERE status='free' AND strftime('%w', starts_at)='4' AND substr(starts_at, 12, 5)='16:00'")
+        con.execute("DELETE FROM slots WHERE status='free' AND strftime('%w', starts_at)='6' AND substr(starts_at, 12, 5)='10:30'")
         con.execute(
             "DELETE FROM slots WHERE status='free' AND starts_at >= ? AND starts_at < ?",
             (SCHEDULE_START.strftime('%Y-%m-%dT%H:%M'), SCHEDULE_END.strftime('%Y-%m-%dT%H:%M'))
@@ -221,6 +225,8 @@ def series_rows(weekday, time_value):
     return rows
 
 def series_available(weekday, time_value):
+    if (weekday, time_value) in BLOCKED_RECURRING_SLOTS:
+        return False
     dates = series_datetimes(weekday, time_value, future_only=True)
     rows = series_rows(weekday, time_value)
     return bool(dates) and len(rows) == len(dates) and all(r['status'] == 'free' for r in rows)
