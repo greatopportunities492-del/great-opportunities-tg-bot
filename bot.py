@@ -24,6 +24,8 @@ KIE_API_URL = os.getenv('KIE_API_URL', 'https://api.kie.ai/gpt-5-2/v1/chat/compl
 ADMIN_ID = int(os.getenv('ADMIN_ID', '0') or '0')
 TEACHER_USERNAME = os.getenv('TEACHER_USERNAME', '').strip().lstrip('@')
 MEMORY_LIMIT = int(os.getenv('MEMORY_LIMIT', '15'))
+START_NOTICE_KEY = 'lessons_start_2026_09_07'
+START_NOTICE_TEXT = '📚 Занятия начнутся с 7.09.2026.'
 if not BOT_TOKEN:
     raise RuntimeError('BOT_TOKEN is not set')
 with open(KB_PATH, 'r', encoding='utf-8') as f:
@@ -105,8 +107,39 @@ def init_db():
             service_code TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS notice_deliveries (
+            notice_key TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            sent_at TEXT NOT NULL,
+            PRIMARY KEY (notice_key, user_id)
+        );
         ''')
     sync_recurring_schedule()
+
+def notice_was_sent(user_id):
+    with db() as con:
+        row = con.execute(
+            'SELECT 1 FROM notice_deliveries WHERE notice_key=? AND user_id=?',
+            (START_NOTICE_KEY, user_id)
+        ).fetchone()
+    return bool(row)
+
+def mark_notice_sent(user_id):
+    with db() as con:
+        con.execute(
+            'INSERT OR IGNORE INTO notice_deliveries(notice_key,user_id,sent_at) VALUES(?,?,?)',
+            (START_NOTICE_KEY, user_id, datetime.now().isoformat(timespec='seconds'))
+        )
+
+async def send_start_notice_if_needed(user_id):
+    if notice_was_sent(user_id):
+        return 'already', None
+    try:
+        await bot.send_message(user_id, START_NOTICE_TEXT)
+        mark_notice_sent(user_id)
+        return 'sent', None
+    except Exception as e:
+        return 'failed', str(e)
 
 def is_admin(uid):
     return ADMIN_ID != 0 and uid == ADMIN_ID
@@ -418,6 +451,72 @@ async def bookings(message: Message):
         out.append(f"#{r['id']} · {format_slot(r['starts_at'])}\n{s['title']} · {r['booked_name']} · TG ID {r['booked_by']}")
     await message.answer('\n\n'.join(out))
 
+@router.message(Command('startnotice'))
+async def start_notice_admin(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    with db() as con:
+        rows = con.execute(
+            "SELECT booked_by, MAX(booked_name) AS booked_name "
+            "FROM slots WHERE status='booked' AND booked_by IS NOT NULL "
+            "GROUP BY booked_by ORDER BY booked_name"
+        ).fetchall()
+
+    if not rows:
+        await message.answer('Сейчас нет записанных учеников для рассылки.')
+        return
+
+    sent = 0
+    already = 0
+    failed = []
+
+    for row in rows:
+        uid = int(row['booked_by'])
+        status, error = await send_start_notice_if_needed(uid)
+        if status == 'sent':
+            sent += 1
+        elif status == 'already':
+            already += 1
+        else:
+            failed.append(f"{row['booked_name'] or uid} · TG ID {uid}")
+
+    result = [
+        f"📨 {START_NOTICE_TEXT}",
+        '',
+        f"✅ Отправлено сейчас: {sent}",
+        f"☑️ Уже было отправлено ранее: {already}",
+        f"⚠️ Не удалось отправить: {len(failed)}",
+        '',
+        'Тем, кто запишется позже, это сообщение будет отправлено автоматически после записи.'
+    ]
+    if failed:
+        result.append('\nНе удалось отправить:\n' + '\n'.join(failed))
+
+    await message.answer('\n'.join(result))
+
+@router.message(Command('startnoticestatus'))
+async def start_notice_status(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    with db() as con:
+        booked = con.execute(
+            "SELECT COUNT(DISTINCT booked_by) AS n FROM slots "
+            "WHERE status='booked' AND booked_by IS NOT NULL"
+        ).fetchone()['n']
+        sent = con.execute(
+            'SELECT COUNT(*) AS n FROM notice_deliveries WHERE notice_key=?',
+            (START_NOTICE_KEY,)
+        ).fetchone()['n']
+
+    await message.answer(
+        f"📨 Статус сообщения\n\n{START_NOTICE_TEXT}\n\n"
+        f"Записанных получателей сейчас: {booked}\n"
+        f"Успешно отправлено ботом: {sent}\n\n"
+        "Telegram не передаёт боту отметку «прочитано», поэтому увидеть факт прочтения нельзя."
+    )
+
 @router.message(Command('pause'))
 async def pause_user(message: Message):
     if not is_admin(message.from_user.id):
@@ -618,13 +717,22 @@ async def confirm_series(callback: CallbackQuery):
         "Время закреплено за учеником на 4 недели. Дополнительного подтверждения от преподавателя не требуется.\n\n"
         "Если нужно второе занятие в неделю, нажмите «📅 Записаться на урок» ещё раз и выберите второе постоянное время."
     )
+    notice_status, notice_error = await send_start_notice_if_needed(user.id)
+    if notice_status == 'sent':
+        notice_admin = '📨 Сообщение о начале занятий отправлено.'
+    elif notice_status == 'already':
+        notice_admin = '📨 Сообщение о начале занятий уже было отправлено ранее.'
+    else:
+        notice_admin = f'⚠️ Сообщение о начале занятий не отправлено: {notice_error}'
+
     await notify_admin(
         f"🔔 Новая регулярная запись\n\n"
         f"Имя: {name}\nTelegram: {uname}\nTG ID: {user.id}\n"
         f"Услуга: {s['title']}\n"
         f"Время: {WEEKDAY_NAMES[weekday]} · {label}\n"
         f"Даты: {dates_text}\n\n"
-        "✅ Клиенту автоматически отправлено подтверждение записи.\n\n"
+        "✅ Клиенту автоматически отправлено подтверждение записи.\n"
+        f"{notice_admin}\n\n"
         f"Ответить: /reply {user.id} Ваш текст"
     )
     await callback.answer('Запись подтверждена')
@@ -658,7 +766,23 @@ async def confirm_booking(callback: CallbackQuery):
     s = service_by_code(code)
     uname = f'@{user.username}' if user.username else 'username не указан'
     await callback.message.answer(f"✅ Заявка принята.\n\n📘 {s['title']}\n🕒 {format_slot(row['starts_at'])}\n\nПреподаватель получил уведомление.")
-    await notify_admin(f"🔔 Новая запись\n\nИмя: {name}\nTelegram: {uname}\nTG ID: {user.id}\nУслуга: {s['title']}\nВремя: {format_slot(row['starts_at'])}\n\nОтветить: /reply {user.id} Ваш текст")
+
+    notice_status, notice_error = await send_start_notice_if_needed(user.id)
+    if notice_status == 'sent':
+        notice_admin = '📨 Сообщение о начале занятий отправлено.'
+    elif notice_status == 'already':
+        notice_admin = '📨 Сообщение о начале занятий уже было отправлено ранее.'
+    else:
+        notice_admin = f'⚠️ Сообщение о начале занятий не отправлено: {notice_error}'
+
+    await notify_admin(
+        f"🔔 Новая запись\n\n"
+        f"Имя: {name}\nTelegram: {uname}\nTG ID: {user.id}\n"
+        f"Услуга: {s['title']}\n"
+        f"Время: {format_slot(row['starts_at'])}\n"
+        f"{notice_admin}\n\n"
+        f"Ответить: /reply {user.id} Ваш текст"
+    )
     await callback.answer('Запись принята')
 
 @router.callback_query(F.data == 'cancelname')
