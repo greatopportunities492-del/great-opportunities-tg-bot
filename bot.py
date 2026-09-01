@@ -440,16 +440,142 @@ async def slots_admin(message: Message):
 async def bookings(message: Message):
     if not is_admin(message.from_user.id):
         return
+
     with db() as con:
-        rows = con.execute("SELECT * FROM slots WHERE status='booked' ORDER BY starts_at").fetchall()
+        rows = con.execute(
+            "SELECT * FROM slots WHERE status='booked' ORDER BY booked_name, starts_at"
+        ).fetchall()
+
     if not rows:
         await message.answer('Записей пока нет.')
         return
-    out = ['Текущие записи:']
+
+    groups = {}
     for r in rows:
-        s = service_by_code(r['service_code']) or {'title': r['service_code']}
-        out.append(f"#{r['id']} · {format_slot(r['starts_at'])}\n{s['title']} · {r['booked_name']} · TG ID {r['booked_by']}")
-    await message.answer('\n\n'.join(out))
+        try:
+            dt = datetime.fromisoformat(r['starts_at'])
+        except Exception:
+            continue
+
+        key = (
+            r['booked_by'],
+            r['booked_name'],
+            r['service_code'],
+            dt.weekday(),
+            dt.strftime('%H:%M')
+        )
+        groups.setdefault(key, []).append(r)
+
+    blocks = []
+    for (uid, name, service_code, weekday, time_value), items in groups.items():
+        items = sorted(items, key=lambda x: x['starts_at'])
+        s = service_by_code(service_code) or {'title': service_code}
+        dates = ', '.join(datetime.fromisoformat(x['starts_at']).strftime('%d.%m') for x in items)
+        representative_id = items[0]['id']
+
+        blocks.append(
+            f"#{representative_id} · {WEEKDAY_NAMES.get(weekday, weekday)} · {time_value}\n"
+            f"{s['title']} · {name} · TG ID {uid}\n"
+            f"Даты: {dates}\n"
+            f"Отменить эту регулярную запись: /cancelbooking {representative_id}"
+        )
+
+    # Telegram ограничивает длину одного сообщения, поэтому отправляем список частями.
+    header = 'Текущие записи:'
+    chunk = header
+    for block in blocks:
+        candidate = chunk + '\n\n' + block
+        if len(candidate) > 3500:
+            await message.answer(chunk)
+            chunk = header + '\n\n' + block
+        else:
+            chunk = candidate
+
+    if chunk != header:
+        await message.answer(chunk)
+
+@router.message(Command('cancelbooking'))
+async def cancel_booking(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    p = message.text.split(maxsplit=1)
+    if len(p) < 2 or not p[1].strip().isdigit():
+        await message.answer(
+            'Формат: /cancelbooking ID\n'
+            'ID возьмите из команды /bookings.'
+        )
+        return
+
+    slot_id = int(p[1].strip())
+
+    with db() as con:
+        row = con.execute(
+            "SELECT * FROM slots WHERE id=? AND status='booked'",
+            (slot_id,)
+        ).fetchone()
+
+        if not row:
+            await message.answer('Подтверждённая запись с таким ID не найдена.')
+            return
+
+        try:
+            target_dt = datetime.fromisoformat(row['starts_at'])
+        except Exception:
+            await message.answer('Не удалось определить день и время этой записи.')
+            return
+
+        booked_by = row['booked_by']
+        booked_name = row['booked_name']
+        service_code = row['service_code']
+        target_weekday = target_dt.weekday()
+        target_time = target_dt.strftime('%H:%M')
+
+        candidates = con.execute(
+            "SELECT * FROM slots "
+            "WHERE status='booked' AND booked_by=? AND service_code=? "
+            "AND starts_at >= ? AND starts_at < ? "
+            "ORDER BY starts_at",
+            (
+                booked_by,
+                service_code,
+                SCHEDULE_START.strftime('%Y-%m-%dT%H:%M'),
+                SCHEDULE_END.strftime('%Y-%m-%dT%H:%M')
+            )
+        ).fetchall()
+
+        ids_to_free = []
+        freed_dates = []
+
+        for item in candidates:
+            try:
+                dt = datetime.fromisoformat(item['starts_at'])
+            except Exception:
+                continue
+            if dt.weekday() == target_weekday and dt.strftime('%H:%M') == target_time:
+                ids_to_free.append(item['id'])
+                freed_dates.append(dt.strftime('%d.%m'))
+
+        if not ids_to_free:
+            await message.answer('Регулярная запись не найдена.')
+            return
+
+        placeholders = ','.join('?' for _ in ids_to_free)
+        con.execute(
+            f"UPDATE slots SET status='free', booked_by=NULL, booked_name=NULL, service_code=NULL "
+            f"WHERE id IN ({placeholders})",
+            ids_to_free
+        )
+
+    service = service_by_code(service_code) or {'title': service_code}
+    await message.answer(
+        f"✅ Регулярная запись отменена.\n\n"
+        f"Ученик: {booked_name}\n"
+        f"Занятие: {service['title']}\n"
+        f"Время: {WEEKDAY_NAMES.get(target_weekday, target_weekday)} · {target_time}\n"
+        f"Освобождены даты: {', '.join(freed_dates)}\n\n"
+        "Если это время есть в текущем расписании, оно снова появится среди свободных окон."
+    )
 
 @router.message(Command('startnotice'))
 async def start_notice_admin(message: Message):
